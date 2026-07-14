@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
-import { getDb } from "../../../../lib/db";
-import { distributeLead } from "../../../../lib/distribution";
+import { getSupabaseAdmin } from "../../../../lib/supabase";
+import { distributeLeadAsync } from "../../../../lib/distribution";
 
 export async function POST(req: Request) {
   try {
@@ -10,97 +10,138 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Telefone e corpo da mensagem são obrigatórios." }, { status: 400 });
     }
 
-    const db = getDb();
+    const supabase = getSupabaseAdmin();
     const cleanPhone = phone.trim();
     const cleanName = name ? name.trim() : "Cliente WhatsApp";
 
-    // 1. Lead Resolver: Procura lead por telefone
-    let lead = db.prepare("SELECT * FROM leads WHERE phone = ?").get(cleanPhone) as any;
-    let leadId = lead?.id;
-    let brokerId = lead?.responsible_broker_id;
-    const isNewLead = !lead;
+    // 1. Lead Resolver: procura lead por telefone
+    const { data: existingLead } = await supabase
+      .from("leads")
+      .select("*")
+      .eq("phone", cleanPhone)
+      .maybeSingle();
+
+    let leadId = existingLead?.id;
+    let brokerId = existingLead?.responsible_broker_id;
+    const isNewLead = !existingLead;
 
     if (isNewLead) {
-      // Call the advanced distribution engine helper
-      const distResult = distributeLead(db, "tenant-1");
+      const distResult = await distributeLeadAsync(supabase, "tenant-1");
       brokerId = distResult.brokerId;
-      const ruleId = distResult.ruleId || "rule-1";
+      const ruleId = distResult.ruleId;
       const decisionReason = distResult.reason;
 
-      // Get selected broker name for logs
-      let brokerName = "Sem corretor (Fila Livre)";
-      if (brokerId) {
-        const brokerObj = db.prepare("SELECT name FROM users WHERE id = ?").get(brokerId) as any;
-        if (brokerObj) brokerName = brokerObj.name;
-      }
+      const { count: leadsCount } = await supabase
+        .from("leads")
+        .select("*", { count: "exact", head: true })
+        .eq("tenant_id", "tenant-1");
 
-      const leadsCount = (db.prepare("SELECT count(*) as count FROM leads").get() as any).count;
-      leadId = "lead-" + Math.random().toString(36).substr(2, 9);
-      const leadCode = `LD-2026-${String(leadsCount + 1).padStart(4, "0")}`;
+      const leadCode = `LD-2026-${String((leadsCount ?? 0) + 1).padStart(4, "0")}`;
 
-      db.prepare(`
-        INSERT INTO leads (id, tenant_id, code, name, phone, entered_at, estimated_value, tracking_source, temperature, stage_id, responsible_broker_id, dedupe_status)
-        VALUES (?, 'tenant-1', ?, ?, ?, datetime('now'), 0.0, 'WhatsApp Webhook', 'quente', 'stage-1', ?, 'unique')
-      `).run(leadId, leadCode, cleanName, cleanPhone, brokerId);
+      const { data: newLead, error: leadErr } = await supabase
+        .from("leads")
+        .insert({
+          tenant_id: "tenant-1",
+          code: leadCode,
+          name: cleanName,
+          phone: cleanPhone,
+          tracking_source: "WhatsApp Webhook",
+          temperature: "quente",
+          responsible_broker_id: brokerId,
+          dedupe_status: "unique",
+        })
+        .select()
+        .single();
 
-      // Log distribution
-      db.prepare(`
-        INSERT INTO distribution_log (id, lead_id, rule_id, assigned_broker_id, decision_reason)
-        VALUES (?, ?, ?, ?, ?)
-      `).run("dist-" + Math.random().toString(36).substr(2, 9), leadId, ruleId, brokerId, decisionReason);
+      if (leadErr) return NextResponse.json({ error: leadErr.message }, { status: 500 });
+      leadId = newLead.id;
 
-      // Audit Log
-      db.prepare(`
-        INSERT INTO audit_log (id, tenant_id, actor_id, action, entity_type, entity_id, details, ip)
-        VALUES (?, 'tenant-1', 'admin-id', 'lead.created', 'leads', ?, ?, '127.0.0.1')
-      `).run(
-        "audit-" + Math.random().toString(36).substr(2, 9),
-        leadId,
-        `Lead ${leadCode} criado automaticamente via Lead Resolver (WhatsApp).`
-      );
+      await Promise.all([
+        supabase.from("distribution_log").insert({
+          lead_id: leadId,
+          rule_id: ruleId,
+          assigned_broker_id: brokerId,
+          decision_reason: decisionReason,
+        }),
+        supabase.from("audit_log").insert({
+          tenant_id: "tenant-1",
+          action: "lead.created",
+          entity_type: "leads",
+          entity_id: leadId,
+          details: `Lead ${leadCode} criado automaticamente via Lead Resolver (WhatsApp).`,
+          ip: "webhook",
+        }),
+      ]);
     }
 
-    // 2. Procura ou cria conversa
-    let conv = db.prepare("SELECT * FROM conversations WHERE identity = ?").get(cleanPhone) as any;
-    let convId = conv?.id;
+    // 2. Canal WhatsApp
+    const { data: channelObj } = await supabase
+      .from("channels")
+      .select("id")
+      .eq("tenant_id", "tenant-1")
+      .eq("type", "whatsapp")
+      .limit(1)
+      .maybeSingle();
 
-    if (!conv) {
-      convId = "conv-" + Math.random().toString(36).substr(2, 9);
-      db.prepare(`
-        INSERT INTO conversations (id, tenant_id, lead_id, assigned_broker_id, status, unread_count, last_message_at, wa_window_expires_at)
-        VALUES (?, 'tenant-1', ?, ?, 'open', 1, datetime('now'), datetime('now', '+24 hours'))
-      `).run(convId, leadId, brokerId);
+    const channelId = channelObj?.id ?? null;
+
+    // 3. Procura ou cria conversa
+    const { data: existingConv } = await supabase
+      .from("conversations")
+      .select("id")
+      .eq("lead_id", leadId)
+      .eq("tenant_id", "tenant-1")
+      .maybeSingle();
+
+    let convId = existingConv?.id;
+
+    if (!existingConv) {
+      const waExpires = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+      const { data: newConv, error: convErr } = await supabase
+        .from("conversations")
+        .insert({
+          tenant_id: "tenant-1",
+          lead_id: leadId,
+          channel_id: channelId,
+          assigned_broker_id: brokerId,
+          status: "open",
+          unread_count: 1,
+          last_message_at: new Date().toISOString(),
+          wa_window_expires_at: waExpires,
+        })
+        .select()
+        .single();
+
+      if (convErr) return NextResponse.json({ error: convErr.message }, { status: 500 });
+      convId = newConv.id;
     } else {
-      db.prepare(`
-        UPDATE conversations 
-        SET unread_count = unread_count + 1,
-            last_message_at = datetime('now'),
-            wa_window_expires_at = datetime('now', '+24 hours')
-        WHERE id = ?
-      `).run(convId);
+      await supabase
+        .from("conversations")
+        .update({
+          unread_count: (existingConv as any).unread_count + 1,
+          last_message_at: new Date().toISOString(),
+          wa_window_expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+        })
+        .eq("id", convId);
     }
 
-    // 3. Insere Mensagem
-    db.prepare(`
-      INSERT INTO messages (id, conversation_id, direction, external_id, sender, content_type, body, occurred_at, status)
-      VALUES (?, ?, 'in', ?, ?, 'text', ?, datetime('now'), 'delivered')
-    `).run(
-      "msg-" + Math.random().toString(36).substr(2, 9),
-      convId,
-      "ext-" + Math.random().toString(36).substr(2, 9),
-      cleanName,
-      body
-    );
-
-    // 4. Insere timeline event
-    db.prepare(`
-      INSERT INTO timeline_events (id, lead_id, type, payload)
-      VALUES (?, ?, 'message', ?)
-    `).run(
-      "time-" + Math.random().toString(36).substr(2, 9),
-      leadId,
-      JSON.stringify({ body, direction: "in" })
-    );
+    // 4. Insere mensagem e timeline
+    await Promise.all([
+      supabase.from("messages").insert({
+        conversation_id: convId,
+        direction: "in",
+        external_id: "ext-" + Math.random().toString(36).substr(2, 9),
+        sender: cleanName,
+        content_type: "text",
+        body,
+        status: "delivered",
+      }),
+      supabase.from("timeline_events").insert({
+        lead_id: leadId,
+        type: "message",
+        payload: { body, direction: "in" },
+      }),
+    ]);
 
     return NextResponse.json({ success: true, leadId, conversationId: convId });
   } catch (err: any) {

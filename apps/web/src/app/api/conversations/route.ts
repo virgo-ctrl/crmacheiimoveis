@@ -1,56 +1,35 @@
 import { NextResponse } from "next/server";
-import { cookies } from "next/headers";
-import { getDb } from "../../../lib/db";
-import { getRlsFilter } from "@crm/auth";
-
-async function getAuthUser(db: any) {
-  const cookieStore = await cookies();
-  const userId = cookieStore.get("crm_session")?.value;
-  if (!userId) return null;
-
-  const user = db.prepare("SELECT * FROM users WHERE id = ?").get(userId) as any;
-  if (!user) return null;
-
-  const roleObj = db.prepare(`
-    SELECT r.name 
-    FROM roles r
-    JOIN user_roles ur ON ur.role_id = r.id
-    WHERE ur.user_id = ?
-  `).get(userId) as any;
-
-  return {
-    ...user,
-    role: roleObj ? roleObj.name : "Corretor",
-  };
-}
+import { getSupabaseAdmin, getAuthUser } from "../../../lib/supabase";
 
 export async function GET() {
   try {
-    const db = getDb();
-    const user = await getAuthUser(db);
+    const user = await getAuthUser();
     if (!user) return NextResponse.json({ error: "Não autenticado." }, { status: 401 });
 
-    const rls = getRlsFilter(user.role, user.id, "c.assigned_broker_id");
+    const supabase = getSupabaseAdmin();
 
-    const sql = `
-      SELECT 
-        c.*, 
-        l.name as leadName, 
-        l.email as leadEmail, 
-        l.phone as leadPhone
-      FROM conversations c
-      LEFT JOIN leads l ON c.lead_id = l.id
-      WHERE ${rls.sql}
-      ORDER BY c.last_message_at DESC
-    `;
+    let query = supabase
+      .from("conversations")
+      .select("*, leads(name, email, phone)")
+      .order("last_message_at", { ascending: false, nullsFirst: false });
 
-    const conversations = db.prepare(sql).all(...rls.params) as any[];
+    if (user.role === "Corretor") {
+      query = query.eq("assigned_broker_id", user.id);
+    } else if (user.role === "Gerente") {
+      const { data: myTeams } = await supabase.from("team_members").select("team_id").eq("user_id", user.id);
+      const teamIds = myTeams?.map((t: any) => t.team_id) ?? [];
+      const { data: members } = await supabase.from("team_members").select("user_id").in("team_id", teamIds);
+      const memberIds = members?.map((m: any) => m.user_id) ?? [user.id];
+      query = query.in("assigned_broker_id", memberIds);
+    }
 
-    const mappedConvs = conversations.map(c => ({
+    const { data: conversations } = await query;
+
+    const mappedConvs = (conversations ?? []).map((c: any) => ({
       id: c.id,
-      channel: c.channel_id ? "whatsapp" : c.channel_id || "whatsapp", // fallback standard channel type
-      identity: c.leadPhone || c.identity,
-      leadName: c.leadName,
+      channel: "whatsapp",
+      identity: c.leads?.phone ?? "",
+      leadName: c.leads?.name ?? "",
       lastMessageAt: c.last_message_at,
       unreadCount: c.unread_count,
       waWindowExpiresAt: c.wa_window_expires_at,

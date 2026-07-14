@@ -1,52 +1,29 @@
 import { NextResponse } from "next/server";
-import { cookies } from "next/headers";
-import { getDb } from "../../../../../lib/db";
-import { getRlsFilter } from "@crm/auth";
-
-async function getAuthUser(db: any) {
-  const cookieStore = await cookies();
-  const userId = cookieStore.get("crm_session")?.value;
-  if (!userId) return null;
-
-  const user = db.prepare("SELECT * FROM users WHERE id = ?").get(userId) as any;
-  if (!user) return null;
-
-  const roleObj = db.prepare(`
-    SELECT r.name 
-    FROM roles r
-    JOIN user_roles ur ON ur.role_id = r.id
-    WHERE ur.user_id = ?
-  `).get(userId) as any;
-
-  return {
-    ...user,
-    role: roleObj ? roleObj.name : "Corretor",
-  };
-}
+import { getSupabaseAdmin, getAuthUser } from "../../../../../lib/supabase";
 
 export async function GET(req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await params;
-    const db = getDb();
-    const user = await getAuthUser(db);
+    const user = await getAuthUser();
     if (!user) return NextResponse.json({ error: "Não autenticado." }, { status: 401 });
 
-    // Assert user has access to conversation via RLS
-    const rls = getRlsFilter(user.role, user.id, "c.assigned_broker_id");
-    const conv = db.prepare(`SELECT * FROM conversations c WHERE c.id = ? AND ${rls.sql}`).get(id, ...rls.params) as any;
+    const supabase = getSupabaseAdmin();
+
+    let convQuery = supabase.from("conversations").select("*").eq("id", id);
+    if (user.role === "Corretor") convQuery = convQuery.eq("assigned_broker_id", user.id);
+
+    const { data: conv } = await convQuery.single();
     if (!conv) return NextResponse.json({ error: "Acesso negado." }, { status: 403 });
 
-    // Fetch messages
-    const messages = db.prepare(`
-      SELECT * FROM messages 
-      WHERE conversation_id = ? 
-      ORDER BY occurred_at ASC
-    `).all(id) as any[];
+    const { data: messages } = await supabase
+      .from("messages")
+      .select("*")
+      .eq("conversation_id", id)
+      .order("occurred_at", { ascending: true });
 
-    // Mark unread count as 0
-    db.prepare("UPDATE conversations SET unread_count = 0 WHERE id = ?").run(id);
+    await supabase.from("conversations").update({ unread_count: 0 }).eq("id", id);
 
-    return NextResponse.json({ messages });
+    return NextResponse.json({ messages: messages ?? [] });
   } catch (err: any) {
     return NextResponse.json({ error: err.message }, { status: 500 });
   }
@@ -55,12 +32,15 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
 export async function POST(req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await params;
-    const db = getDb();
-    const user = await getAuthUser(db);
+    const user = await getAuthUser();
     if (!user) return NextResponse.json({ error: "Não autenticado." }, { status: 401 });
 
-    const rls = getRlsFilter(user.role, user.id, "c.assigned_broker_id");
-    const conv = db.prepare(`SELECT * FROM conversations c WHERE c.id = ? AND ${rls.sql}`).get(id, ...rls.params) as any;
+    const supabase = getSupabaseAdmin();
+
+    let convQuery = supabase.from("conversations").select("*").eq("id", id);
+    if (user.role === "Corretor") convQuery = convQuery.eq("assigned_broker_id", user.id);
+
+    const { data: conv } = await convQuery.single();
     if (!conv) return NextResponse.json({ error: "Acesso negado." }, { status: 403 });
 
     const { body, type, templateId, variables } = await req.json();
@@ -68,15 +48,13 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     let messageBody = body;
     let contentType = type || "text";
 
-    // Enforce 24h WhatsApp rules
-    const isWaExpired = conv.channel_id === "chan-1" && new Date(conv.wa_window_expires_at) < new Date();
-    
+    const isWaExpired = conv.wa_window_expires_at && new Date(conv.wa_window_expires_at) < new Date();
     if (isWaExpired && contentType !== "template") {
       return NextResponse.json({ error: "Janela de 24h expirada. WhatsApp oficial exige envio de templates aprovados." }, { status: 400 });
     }
 
     if (contentType === "template" && templateId) {
-      const template = db.prepare("SELECT * FROM message_templates WHERE id = ?").get(templateId) as any;
+      const { data: template } = await supabase.from("message_templates").select("*").eq("id", templateId).single();
       if (!template) return NextResponse.json({ error: "Template não encontrado." }, { status: 404 });
 
       messageBody = template.body;
@@ -86,57 +64,37 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       });
     }
 
-    const messageId = "msg-" + Math.random().toString(36).substr(2, 9);
-    const occurredAt = new Date().toISOString();
+    const now = new Date().toISOString();
 
-    // Insert message
-    db.prepare(`
-      INSERT INTO messages (id, conversation_id, direction, external_id, sender, content_type, body, occurred_at, status)
-      VALUES (?, ?, 'out', ?, ?, ?, ?, ?, 'sent')
-    `).run(
-      messageId,
-      id,
-      "ext-" + Math.random().toString(36).substr(2, 9),
-      user.name,
-      contentType,
-      messageBody,
-      occurredAt
-    );
+    const { data: newMsg } = await supabase.from("messages").insert({
+      conversation_id: id,
+      direction: "out",
+      external_id: `ext-${Math.random().toString(36).substr(2, 9)}`,
+      sender: user.name,
+      content_type: contentType,
+      body: messageBody,
+      status: "sent",
+    }).select("id").single();
 
-    // Update conversation last message & refresh 24h window
-    db.prepare(`
-      UPDATE conversations 
-      SET last_message_at = ?,
-          wa_window_expires_at = datetime('now', '+24 hours')
-      WHERE id = ?
-    `).run(occurredAt, id);
+    await supabase.from("conversations").update({
+      last_message_at: now,
+      wa_window_expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+    }).eq("id", id);
 
-    // Save timeline event for lead
     if (conv.lead_id) {
-      db.prepare(`
-        INSERT INTO timeline_events (id, lead_id, type, actor_id, payload)
-        VALUES (?, ?, 'message', ?, ?)
-      `).run(
-        "time-" + Math.random().toString(36).substr(2, 9),
-        conv.lead_id,
-        user.id,
-        JSON.stringify({ body: messageBody, direction: "out" })
-      );
+      await supabase.from("timeline_events").insert({
+        lead_id: conv.lead_id, type: "message", actor_id: user.id,
+        payload: { body: messageBody, direction: "out" },
+      });
     }
 
-    // Write audit log
-    db.prepare(`
-      INSERT INTO audit_log (id, tenant_id, actor_id, action, entity_type, entity_id, details, ip)
-      VALUES (?, ?, ?, 'conversation.reply', 'conversations', ?, ?, '127.0.0.1')
-    `).run(
-      "audit-" + Math.random().toString(36).substr(2, 9),
-      user.tenant_id,
-      user.id,
-      id,
-      `Mensagem de saída enviada para ${conv.identity}. Tipo: ${contentType}.`
-    );
+    await supabase.from("audit_log").insert({
+      tenant_id: user.tenant_id, actor_id: user.id, action: "conversation.reply",
+      entity_type: "conversations", entity_id: id,
+      details: `Mensagem de saída enviada. Tipo: ${contentType}.`, ip: "127.0.0.1",
+    });
 
-    return NextResponse.json({ success: true, messageId, body: messageBody });
+    return NextResponse.json({ success: true, messageId: newMsg?.id, body: messageBody });
   } catch (err: any) {
     return NextResponse.json({ error: err.message }, { status: 500 });
   }

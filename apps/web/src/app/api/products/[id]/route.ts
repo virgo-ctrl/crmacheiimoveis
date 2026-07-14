@@ -1,92 +1,99 @@
 import { NextResponse } from "next/server";
-import { cookies } from "next/headers";
-import { getDb } from "../../../../lib/db";
-import { normalizeKey } from "@crm/validation";
+import { getSupabaseAdmin, getAuthUser } from "../../../../lib/supabase";
 
-async function getAuthUser(db: any) {
-  const cookieStore = await cookies();
-  const userId = cookieStore.get("crm_session")?.value;
-  if (!userId) return null;
-  const user = db.prepare("SELECT * FROM users WHERE id = ?").get(userId) as any;
-  if (!user) return null;
-  const roleObj = db.prepare(`
-    SELECT r.name FROM roles r
-    JOIN user_roles ur ON ur.role_id = r.id
-    WHERE ur.user_id = ?
-  `).get(userId) as any;
-  return { ...user, role: roleObj ? roleObj.name : "Corretor" };
-}
-
-// EDITAR empreendimento
 export async function PUT(req: Request, { params }: { params: Promise<{ id: string }> }) {
-  try {
-    const { id } = await params;
-    const db = getDb();
-    const user = await getAuthUser(db);
-    if (!user) return NextResponse.json({ error: "Não autenticado." }, { status: 401 });
-    if (user.role !== "Admin") return NextResponse.json({ error: "Apenas administradores podem editar o catálogo." }, { status: 403 });
+  const { id } = await params;
+  const supabase = getSupabaseAdmin();
+  const user = await getAuthUser();
+  if (!user) return NextResponse.json({ error: "Não autenticado." }, { status: 401 });
+  if (user.role !== "Admin") return NextResponse.json({ error: "Apenas administradores podem editar o catálogo." }, { status: 403 });
 
-    const dev = db.prepare("SELECT * FROM developments WHERE id = ? AND tenant_id = ?").get(id, user.tenant_id) as any;
-    if (!dev) return NextResponse.json({ error: "Empreendimento não encontrado." }, { status: 404 });
+  const { data: dev } = await supabase
+    .from("developments")
+    .select("*")
+    .eq("id", id)
+    .eq("tenant_id", user.tenant_id)
+    .maybeSingle();
 
-    const { name, developerId, type, address, city, region, vgv } = await req.json();
-    if (!name) return NextResponse.json({ error: "O nome é obrigatório." }, { status: 400 });
+  if (!dev) return NextResponse.json({ error: "Empreendimento não encontrado." }, { status: 404 });
 
-    const normKey = normalizeKey(name);
-    // D4: checar duplicidade em outro registro
-    const dup = db.prepare("SELECT * FROM developments WHERE normalized_key = ? AND tenant_id = ? AND id != ?").get(normKey, user.tenant_id, id) as any;
-    if (dup) return NextResponse.json({ error: `Erro D4: "${name}" já existe como "${dup.name}".` }, { status: 409 });
+  const body = await req.json();
+  const { name, developerId, type, address, city, region, vgv } = body;
+  if (!name) return NextResponse.json({ error: "O nome é obrigatório." }, { status: 400 });
 
-    db.prepare(`
-      UPDATE developments
-      SET name = ?, developer_id = ?, type = ?, address = ?, city = ?, region = ?, vgv = ?, normalized_key = ?
-      WHERE id = ?
-    `).run(name, developerId || null, type || dev.type, address ?? dev.address, city ?? dev.city, region ?? dev.region, Number(vgv) || 0, normKey, id);
+  // D4: checar duplicidade em outro registro
+  const { data: dup } = await supabase
+    .from("developments")
+    .select("id, name")
+    .eq("tenant_id", user.tenant_id)
+    .ilike("name", name)
+    .neq("id", id)
+    .maybeSingle();
 
-    db.prepare(`
-      INSERT INTO audit_log (id, tenant_id, actor_id, action, entity_type, entity_id, before, after, ip)
-      VALUES (?, ?, ?, 'product.updated', 'developments', ?, ?, ?, '127.0.0.1')
-    `).run(
-      "audit-" + Math.random().toString(36).substr(2, 9),
-      user.tenant_id, user.id, id,
-      JSON.stringify({ name: dev.name, vgv: dev.vgv }),
-      JSON.stringify({ name, vgv: Number(vgv) || 0 })
-    );
+  if (dup) return NextResponse.json({ error: `Erro D4: "${name}" já existe como "${(dup as any).name}".` }, { status: 409 });
 
-    return NextResponse.json({ success: true });
-  } catch (err: any) {
-    return NextResponse.json({ error: err.message }, { status: 500 });
-  }
+  const updates: Record<string, unknown> = { name };
+  if (developerId !== undefined) updates.developer_id = developerId || null;
+  if (type !== undefined) updates.type = type;
+  if (address !== undefined) updates.address = address;
+  if (city !== undefined) updates.city = city;
+  if (region !== undefined) updates.region = region;
+  if (vgv !== undefined) updates.vgv = Number(vgv) || 0;
+
+  const { error } = await supabase
+    .from("developments")
+    .update(updates)
+    .eq("id", id)
+    .eq("tenant_id", user.tenant_id);
+
+  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+
+  await supabase.from("audit_log").insert({
+    tenant_id: user.tenant_id,
+    actor_id: user.id,
+    action: "product.updated",
+    entity_type: "developments",
+    entity_id: id,
+    before: { name: dev.name, vgv: dev.vgv },
+    after: { name, vgv: Number(vgv) || 0 },
+    ip: "server",
+  });
+
+  return NextResponse.json({ success: true });
 }
 
-// APAGAR empreendimento
 export async function DELETE(req: Request, { params }: { params: Promise<{ id: string }> }) {
-  try {
-    const { id } = await params;
-    const db = getDb();
-    const user = await getAuthUser(db);
-    if (!user) return NextResponse.json({ error: "Não autenticado." }, { status: 401 });
-    if (user.role !== "Admin") return NextResponse.json({ error: "Apenas administradores podem excluir do catálogo." }, { status: 403 });
+  const { id } = await params;
+  const supabase = getSupabaseAdmin();
+  const user = await getAuthUser();
+  if (!user) return NextResponse.json({ error: "Não autenticado." }, { status: 401 });
+  if (user.role !== "Admin") return NextResponse.json({ error: "Apenas administradores podem excluir do catálogo." }, { status: 403 });
 
-    const dev = db.prepare("SELECT * FROM developments WHERE id = ? AND tenant_id = ?").get(id, user.tenant_id) as any;
-    if (!dev) return NextResponse.json({ error: "Empreendimento não encontrado." }, { status: 404 });
+  const { data: dev } = await supabase
+    .from("developments")
+    .select("id, name")
+    .eq("id", id)
+    .eq("tenant_id", user.tenant_id)
+    .maybeSingle();
 
-    // Limpa vínculos e unidades para não deixar órfãos
-    try { db.prepare("DELETE FROM lead_interests WHERE development_id = ?").run(id); } catch {}
-    try { db.prepare("DELETE FROM properties WHERE development_id = ?").run(id); } catch {}
-    db.prepare("DELETE FROM developments WHERE id = ?").run(id);
+  if (!dev) return NextResponse.json({ error: "Empreendimento não encontrado." }, { status: 404 });
 
-    db.prepare(`
-      INSERT INTO audit_log (id, tenant_id, actor_id, action, entity_type, entity_id, details, ip)
-      VALUES (?, ?, ?, 'product.deleted', 'developments', ?, ?, '127.0.0.1')
-    `).run(
-      "audit-" + Math.random().toString(36).substr(2, 9),
-      user.tenant_id, user.id, id,
-      `Empreendimento "${dev.name}" excluído.`
-    );
+  // Limpa vínculos antes de excluir
+  await supabase.from("lead_interests").delete().eq("development_id", id);
+  await supabase.from("properties").delete().eq("development_id", id);
 
-    return NextResponse.json({ success: true });
-  } catch (err: any) {
-    return NextResponse.json({ error: err.message }, { status: 500 });
-  }
+  const { error } = await supabase.from("developments").delete().eq("id", id).eq("tenant_id", user.tenant_id);
+  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+
+  await supabase.from("audit_log").insert({
+    tenant_id: user.tenant_id,
+    actor_id: user.id,
+    action: "product.deleted",
+    entity_type: "developments",
+    entity_id: id,
+    details: `Empreendimento "${(dev as any).name}" excluído.`,
+    ip: "server",
+  });
+
+  return NextResponse.json({ success: true });
 }

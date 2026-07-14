@@ -1,54 +1,35 @@
 import { NextResponse } from "next/server";
-import { cookies } from "next/headers";
-import { getDb } from "../../../../lib/db";
-
-async function getAuthUser(db: any) {
-  const cookieStore = await cookies();
-  const userId = cookieStore.get("crm_session")?.value;
-  if (!userId) return null;
-
-  const user = db.prepare("SELECT * FROM users WHERE id = ?").get(userId) as any;
-  if (!user) return null;
-
-  const roleObj = db.prepare(`
-    SELECT r.name 
-    FROM roles r
-    JOIN user_roles ur ON ur.role_id = r.id
-    WHERE ur.user_id = ?
-  `).get(userId) as any;
-
-  return {
-    ...user,
-    role: roleObj ? roleObj.name : "Corretor",
-  };
-}
+import { getSupabaseAdmin, getAuthUser } from "../../../../lib/supabase";
 
 export async function GET() {
   try {
-    const db = getDb();
-    const user = await getAuthUser(db);
+    const user = await getAuthUser();
     if (!user) return NextResponse.json({ error: "Não autenticado." }, { status: 401 });
 
-    let sql = `
-      SELECT s.*, u.name as brokerName, t.name as teamName
-      FROM shifts s
-      JOIN users u ON s.user_id = u.id
-      LEFT JOIN teams t ON s.team_id = t.id
-      WHERE s.tenant_id = ?
-    `;
-    const params = [user.tenant_id];
+    const supabase = getSupabaseAdmin();
 
-    if (user.role === "Gerente") {
-      sql += ` AND s.team_id IN (SELECT team_id FROM team_members WHERE user_id = ?)`;
-      params.push(user.id);
-    } else if (user.role === "Corretor") {
-      sql += ` AND s.user_id = ?`;
-      params.push(user.id);
+    let query = supabase
+      .from("shifts")
+      .select("*, users!shifts_user_id_fkey(name), teams(name)")
+      .eq("tenant_id", user.tenant_id);
+
+    if (user.role === "Corretor") {
+      query = query.eq("user_id", user.id);
+    } else if (user.role === "Gerente") {
+      const { data: myTeams } = await supabase.from("team_members").select("team_id").eq("user_id", user.id);
+      const teamIds = myTeams?.map((t: any) => t.team_id) ?? [];
+      query = query.in("team_id", teamIds);
     }
 
-    const shifts = db.prepare(sql).all(...params) as any[];
+    const { data: shifts } = await query;
 
-    return NextResponse.json({ shifts });
+    return NextResponse.json({
+      shifts: (shifts ?? []).map((s: any) => ({
+        ...s,
+        brokerName: s.users?.name,
+        teamName: s.teams?.name,
+      })),
+    });
   } catch (err: any) {
     return NextResponse.json({ error: err.message }, { status: 500 });
   }
@@ -56,40 +37,34 @@ export async function GET() {
 
 export async function POST(req: Request) {
   try {
-    const db = getDb();
-    const user = await getAuthUser(db);
+    const user = await getAuthUser();
     if (!user) return NextResponse.json({ error: "Não autenticado." }, { status: 401 });
-    if (user.role !== "Admin" && user.role !== "Gerente") {
-      return NextResponse.json({ error: "Apenas administradores e gerentes podem criar plantões." }, { status: 403 });
-    }
+    if (user.role !== "Admin" && user.role !== "Gerente") return NextResponse.json({ error: "Apenas administradores e gerentes podem criar plantões." }, { status: 403 });
 
+    const supabase = getSupabaseAdmin();
     const { userId, teamId, location, startsAt, endsAt, recurrence } = await req.json();
 
     if (!userId || !startsAt || !endsAt) {
       return NextResponse.json({ error: "Usuário, data inicial e final são obrigatórios." }, { status: 400 });
     }
 
-    const shiftId = "shift-" + Math.random().toString(36).substr(2, 9);
-    
-    db.prepare(`
-      INSERT INTO shifts (id, tenant_id, team_id, user_id, location, starts_at, ends_at, recurrence)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(shiftId, user.tenant_id, teamId || null, userId, location || "Online", startsAt, endsAt, recurrence || null);
+    const { data: shift, error } = await supabase.from("shifts").insert({
+      tenant_id: user.tenant_id, team_id: teamId || null,
+      user_id: userId, location: location || "Online",
+      starts_at: startsAt, ends_at: endsAt, recurrence: recurrence || null,
+    }).select("id").single();
 
-    const broker = db.prepare("SELECT name FROM users WHERE id = ?").get(userId) as any;
+    if (error) throw new Error(error.message);
 
-    db.prepare(`
-      INSERT INTO audit_log (id, tenant_id, actor_id, action, entity_type, entity_id, details)
-      VALUES (?, ?, ?, 'shift.created', 'shifts', ?, ?)
-    `).run(
-      "audit-" + Math.random().toString(36).substr(2, 9),
-      user.tenant_id,
-      user.id,
-      shiftId,
-      `Plantão agendado para o corretor "${broker?.name || userId}" em ${location || "Online"}.`
-    );
+    const { data: broker } = await supabase.from("users").select("name").eq("id", userId).single();
 
-    return NextResponse.json({ success: true, shiftId });
+    await supabase.from("audit_log").insert({
+      tenant_id: user.tenant_id, actor_id: user.id, action: "shift.created",
+      entity_type: "shifts", entity_id: shift!.id,
+      details: `Plantão agendado para "${broker?.name ?? userId}" em ${location || "Online"}.`,
+    });
+
+    return NextResponse.json({ success: true, shiftId: shift!.id });
   } catch (err: any) {
     return NextResponse.json({ error: err.message }, { status: 500 });
   }
@@ -97,33 +72,30 @@ export async function POST(req: Request) {
 
 export async function PUT(req: Request) {
   try {
-    const db = getDb();
-    const user = await getAuthUser(db);
+    const user = await getAuthUser();
     if (!user) return NextResponse.json({ error: "Não autenticado." }, { status: 401 });
-    if (user.role !== "Admin" && user.role !== "Gerente") {
-      return NextResponse.json({ error: "Permissão negada." }, { status: 403 });
-    }
+    if (user.role !== "Admin" && user.role !== "Gerente") return NextResponse.json({ error: "Permissão negada." }, { status: 403 });
 
+    const supabase = getSupabaseAdmin();
     const { id, userId, teamId, location, startsAt, endsAt, recurrence } = await req.json();
 
-    const shift = db.prepare("SELECT * FROM shifts WHERE id = ? AND tenant_id = ?").get(id, user.tenant_id) as any;
+    const { data: shift } = await supabase.from("shifts").select("*").eq("id", id).eq("tenant_id", user.tenant_id).single();
     if (!shift) return NextResponse.json({ error: "Plantão não encontrado." }, { status: 404 });
 
-    db.prepare(`
-      UPDATE shifts
-      SET user_id = COALESCE(?, user_id),
-          team_id = COALESCE(?, team_id),
-          location = COALESCE(?, location),
-          starts_at = COALESCE(?, starts_at),
-          ends_at = COALESCE(?, ends_at),
-          recurrence = COALESCE(?, recurrence)
-      WHERE id = ?
-    `).run(userId, teamId, location, startsAt, endsAt, recurrence, id);
+    const updates: any = {};
+    if (userId) updates.user_id = userId;
+    if (teamId) updates.team_id = teamId;
+    if (location) updates.location = location;
+    if (startsAt) updates.starts_at = startsAt;
+    if (endsAt) updates.ends_at = endsAt;
+    if (recurrence) updates.recurrence = recurrence;
 
-    db.prepare(`
-      INSERT INTO audit_log (id, tenant_id, actor_id, action, entity_type, entity_id, details)
-      VALUES (?, ?, ?, 'shift.updated', 'shifts', ?, 'Plantão atualizado pelo gestor.')
-    `).run("audit-" + Math.random().toString(36).substr(2, 9), user.tenant_id, user.id, id);
+    await supabase.from("shifts").update(updates).eq("id", id);
+
+    await supabase.from("audit_log").insert({
+      tenant_id: user.tenant_id, actor_id: user.id, action: "shift.updated",
+      entity_type: "shifts", entity_id: id, details: "Plantão atualizado pelo gestor.",
+    });
 
     return NextResponse.json({ success: true });
   } catch (err: any) {
@@ -133,24 +105,22 @@ export async function PUT(req: Request) {
 
 export async function DELETE(req: Request) {
   try {
-    const db = getDb();
-    const user = await getAuthUser(db);
+    const user = await getAuthUser();
     if (!user) return NextResponse.json({ error: "Não autenticado." }, { status: 401 });
-    if (user.role !== "Admin" && user.role !== "Gerente") {
-      return NextResponse.json({ error: "Permissão negada." }, { status: 403 });
-    }
+    if (user.role !== "Admin" && user.role !== "Gerente") return NextResponse.json({ error: "Permissão negada." }, { status: 403 });
 
+    const supabase = getSupabaseAdmin();
     const { id } = await req.json();
 
-    const shift = db.prepare("SELECT * FROM shifts WHERE id = ? AND tenant_id = ?").get(id, user.tenant_id) as any;
+    const { data: shift } = await supabase.from("shifts").select("*").eq("id", id).eq("tenant_id", user.tenant_id).single();
     if (!shift) return NextResponse.json({ error: "Plantão não encontrado." }, { status: 404 });
 
-    db.prepare("DELETE FROM shifts WHERE id = ?").run(id);
+    await supabase.from("shifts").delete().eq("id", id);
 
-    db.prepare(`
-      INSERT INTO audit_log (id, tenant_id, actor_id, action, entity_type, entity_id, details)
-      VALUES (?, ?, ?, 'shift.deleted', 'shifts', ?, 'Plantão excluído.')
-    `).run("audit-" + Math.random().toString(36).substr(2, 9), user.tenant_id, user.id, id);
+    await supabase.from("audit_log").insert({
+      tenant_id: user.tenant_id, actor_id: user.id, action: "shift.deleted",
+      entity_type: "shifts", entity_id: id, details: "Plantão excluído.",
+    });
 
     return NextResponse.json({ success: true });
   } catch (err: any) {

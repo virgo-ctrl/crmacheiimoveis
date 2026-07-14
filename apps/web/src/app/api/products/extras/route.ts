@@ -1,225 +1,175 @@
 import { NextResponse } from "next/server";
-import { cookies } from "next/headers";
-import { getDb } from "../../../../lib/db";
-import { normalizeKey } from "@crm/validation";
+import { getSupabaseAdmin, getAuthUser } from "../../../../lib/supabase";
 
-async function getAuthUser(db: any) {
-  const cookieStore = await cookies();
-  const userId = cookieStore.get("crm_session")?.value;
-  if (!userId) return null;
-  const user = db.prepare("SELECT * FROM users WHERE id = ?").get(userId) as any;
-  if (!user) return null;
-  const roleObj = db.prepare(`
-    SELECT r.name FROM roles r
-    JOIN user_roles ur ON ur.role_id = r.id
-    WHERE ur.user_id = ?
-  `).get(userId) as any;
-  return { ...user, role: roleObj ? roleObj.name : "Corretor" };
-}
+export async function GET(req: Request) {
+  const supabase = getSupabaseAdmin();
+  const user = await getAuthUser();
+  if (!user) return NextResponse.json({ error: "Não autenticado." }, { status: 401 });
 
-export async function GET() {
-  try {
-    const db = getDb();
-    const user = await getAuthUser(db);
-    if (!user) return NextResponse.json({ error: "Não autenticado." }, { status: 401 });
+  const [devResult, propResult] = await Promise.all([
+    supabase.from("developers").select("*").eq("tenant_id", user.tenant_id),
+    supabase
+      .from("properties")
+      .select("*, developments(name)")
+      .eq("tenant_id", user.tenant_id),
+  ]);
 
-    const developers = db.prepare("SELECT * FROM developers WHERE tenant_id = ?").all(user.tenant_id) as any[];
-    const properties = db.prepare(`
-      SELECT p.*, d.name as developmentName 
-      FROM properties p
-      LEFT JOIN developments d ON p.development_id = d.id
-      WHERE p.tenant_id = ?
-    `).all(user.tenant_id) as any[];
+  const properties = (propResult.data ?? []).map((p: any) => ({
+    ...p,
+    developmentName: p.developments?.name ?? null,
+    developments: undefined,
+  }));
 
-    return NextResponse.json({ developers, properties });
-  } catch (err: any) {
-    return NextResponse.json({ error: err.message }, { status: 500 });
-  }
+  return NextResponse.json({
+    developers: devResult.data ?? [],
+    properties,
+  });
 }
 
 export async function POST(req: Request) {
-  try {
-    const db = getDb();
-    const user = await getAuthUser(db);
-    if (!user) return NextResponse.json({ error: "Não autenticado." }, { status: 401 });
-    if (user.role !== "Admin") {
-      return NextResponse.json({ error: "Apenas administradores podem cadastrar produtos e construtoras." }, { status: 403 });
+  const supabase = getSupabaseAdmin();
+  const user = await getAuthUser();
+  if (!user) return NextResponse.json({ error: "Não autenticado." }, { status: 401 });
+  if (user.role !== "Admin") return NextResponse.json({ error: "Apenas administradores podem cadastrar produtos e construtoras." }, { status: 403 });
+
+  const body = await req.json();
+  const { type, name, cnpj, contact, address, number, country, state, city, neighborhood, zip, complement,
+    developmentId, developerId, code, price, area, bedrooms, status } = body;
+
+  if (type === "developer") {
+    if (!name || !cnpj) return NextResponse.json({ error: "Nome e CNPJ da construtora são obrigatórios." }, { status: 400 });
+
+    const { data: existing } = await supabase
+      .from("developers")
+      .select("id, name")
+      .eq("tenant_id", user.tenant_id)
+      .eq("cnpj", cnpj.replace(/[^\d]/g, ""))
+      .maybeSingle();
+
+    if (existing) {
+      return NextResponse.json({ error: `Erro D4: A construtora com CNPJ "${cnpj}" já está cadastrada como "${(existing as any).name}".` }, { status: 409 });
     }
 
-    const { 
-      type, name, cnpj, contact, 
-      address, number, country, state, city, neighborhood, zip, complement,
-      developmentId, developerId, code, price, area, bedrooms, status 
-    } = await req.json();
+    const { data: inserted, error } = await supabase
+      .from("developers")
+      .insert({ tenant_id: user.tenant_id, name, cnpj, contact, address, number, country: country ?? "Brasil", state, city, neighborhood, zip, complement })
+      .select()
+      .single();
 
-    if (type === "developer") {
-      if (!name || !cnpj) {
-        return NextResponse.json({ error: "Nome e CNPJ da construtora são obrigatórios." }, { status: 400 });
-      }
+    if (error) return NextResponse.json({ error: error.message }, { status: 500 });
 
-      // Check unique CNPJ constraint (D4)
-      const cleanCnpj = cnpj.replace(/[^\d]/g, "");
-      const existing = db.prepare("SELECT * FROM developers WHERE tenant_id = ? AND REPLACE(REPLACE(REPLACE(cnpj, '.', ''), '/', ''), '-', '') = ?").get(user.tenant_id, cleanCnpj);
-      if (existing) {
-        return NextResponse.json({ error: `Erro D4: A construtora com CNPJ "${cnpj}" já está cadastrada como "${(existing as any).name}".` }, { status: 409 });
-      }
+    await supabase.from("audit_log").insert({
+      tenant_id: user.tenant_id, actor_id: user.id,
+      action: "developer.created", entity_type: "developers", entity_id: inserted.id,
+      details: `Construtora "${name}" (CNPJ: ${cnpj}) cadastrada.`, ip: "server",
+    });
 
-      const id = "dev-" + Math.random().toString(36).substr(2, 9);
-      db.prepare(`
-        INSERT INTO developers (id, tenant_id, name, cnpj, contact, address, number, country, state, city, neighborhood, zip, complement)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        id, 
-        user.tenant_id, 
-        name, 
-        cnpj, 
-        contact || "", 
-        address || "", 
-        number || "", 
-        country || "Brasil", 
-        state || "", 
-        city || "", 
-        neighborhood || "", 
-        zip || "", 
-        complement || ""
-      );
-
-      db.prepare(`
-        INSERT INTO audit_log (id, tenant_id, actor_id, action, entity_type, entity_id, details)
-        VALUES (?, ?, ?, 'developer.created', 'developers', ?, ?)
-      `).run("audit-" + Math.random().toString(36).substr(2, 9), user.tenant_id, user.id, id, `Construtora "${name}" (CNPJ: ${cnpj}) cadastrada.`);
-
-      return NextResponse.json({ success: true, id });
-    } else if (type === "property") {
-      if (!code || !price) {
-        return NextResponse.json({ error: "Código/Número da unidade e preço são obrigatórios." }, { status: 400 });
-      }
-
-      const id = "prop-" + Math.random().toString(36).substr(2, 9);
-      db.prepare(`
-        INSERT INTO properties (id, tenant_id, development_id, developer_id, code, type, price, area, bedrooms, status)
-        VALUES (?, ?, ?, ?, ?, 'Apartamento', ?, ?, ?, ?)
-      `).run(
-        id,
-        user.tenant_id,
-        developmentId || null,
-        developerId || null,
-        code,
-        Number(price) || 0,
-        Number(area) || 0,
-        Number(bedrooms) || 0,
-        status || "disponível"
-      );
-
-      db.prepare(`
-        INSERT INTO audit_log (id, tenant_id, actor_id, action, entity_type, entity_id, details)
-        VALUES (?, ?, ?, 'property.created', 'properties', ?, ?)
-      `).run("audit-" + Math.random().toString(36).substr(2, 9), user.tenant_id, user.id, id, `Unidade "${code}" cadastrada.`);
-
-      return NextResponse.json({ success: true, id });
-    } else {
-      return NextResponse.json({ error: "Tipo de produto inválido." }, { status: 400 });
-    }
-  } catch (err: any) {
-    return NextResponse.json({ error: err.message }, { status: 500 });
+    return NextResponse.json({ success: true, id: inserted.id }, { status: 201 });
   }
+
+  if (type === "property") {
+    if (!code || !price) return NextResponse.json({ error: "Código da unidade e preço são obrigatórios." }, { status: 400 });
+
+    const { data: inserted, error } = await supabase
+      .from("properties")
+      .insert({
+        tenant_id: user.tenant_id,
+        development_id: developmentId ?? null,
+        developer_id: developerId ?? null,
+        code,
+        type: "Apartamento",
+        price: Number(price),
+        area: Number(area) || 0,
+        bedrooms: Number(bedrooms) || 0,
+        status: status ?? "disponível",
+      })
+      .select()
+      .single();
+
+    if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+
+    await supabase.from("audit_log").insert({
+      tenant_id: user.tenant_id, actor_id: user.id,
+      action: "property.created", entity_type: "properties", entity_id: inserted.id,
+      details: `Unidade "${code}" cadastrada.`, ip: "server",
+    });
+
+    return NextResponse.json({ success: true, id: inserted.id }, { status: 201 });
+  }
+
+  return NextResponse.json({ error: "Tipo de produto inválido." }, { status: 400 });
 }
 
 export async function PUT(req: Request) {
-  try {
-    const db = getDb();
-    const user = await getAuthUser(db);
-    if (!user) return NextResponse.json({ error: "Não autenticado." }, { status: 401 });
-    if (user.role !== "Admin") return NextResponse.json({ error: "Apenas Admin." }, { status: 403 });
+  const supabase = getSupabaseAdmin();
+  const user = await getAuthUser();
+  if (!user) return NextResponse.json({ error: "Não autenticado." }, { status: 401 });
+  if (user.role !== "Admin") return NextResponse.json({ error: "Apenas Admin." }, { status: 403 });
 
-    const { 
-      type, id, name, cnpj, contact, 
-      address, number, country, state, city, neighborhood, zip, complement,
-      code, price, area, bedrooms, status, developmentId, developerId 
-    } = await req.json();
+  const body = await req.json();
+  const { type, id, name, cnpj, contact, address, number, country, state, city, neighborhood, zip, complement,
+    code, price, area, bedrooms, status, developmentId, developerId } = body;
 
-    if (type === "developer") {
-      db.prepare(`
-        UPDATE developers
-        SET name = COALESCE(?, name),
-            cnpj = COALESCE(?, cnpj),
-            contact = COALESCE(?, contact),
-            address = COALESCE(?, address),
-            number = COALESCE(?, number),
-            country = COALESCE(?, country),
-            state = COALESCE(?, state),
-            city = COALESCE(?, city),
-            neighborhood = COALESCE(?, neighborhood),
-            zip = COALESCE(?, zip),
-            complement = COALESCE(?, complement)
-        WHERE id = ? AND tenant_id = ?
-      `).run(
-        name, 
-        cnpj, 
-        contact, 
-        address, 
-        number, 
-        country, 
-        state, 
-        city, 
-        neighborhood, 
-        zip, 
-        complement, 
-        id, 
-        user.tenant_id
-      );
-    } else if (type === "property") {
-      db.prepare(`
-        UPDATE properties
-        SET code = COALESCE(?, code),
-            price = COALESCE(?, price),
-            area = COALESCE(?, area),
-            bedrooms = COALESCE(?, bedrooms),
-            status = COALESCE(?, status),
-            development_id = COALESCE(?, development_id),
-            developer_id = COALESCE(?, developer_id)
-        WHERE id = ? AND tenant_id = ?
-      `).run(
-        code, 
-        price, 
-        area, 
-        bedrooms, 
-        status, 
-        developmentId, 
-        developerId, 
-        id, 
-        user.tenant_id
-      );
-    }
+  if (!id) return NextResponse.json({ error: "ID obrigatório." }, { status: 400 });
 
-    return NextResponse.json({ success: true });
-  } catch (err: any) {
-    return NextResponse.json({ error: err.message }, { status: 500 });
+  if (type === "developer") {
+    const updates: Record<string, unknown> = {};
+    if (name !== undefined) updates.name = name;
+    if (cnpj !== undefined) updates.cnpj = cnpj;
+    if (contact !== undefined) updates.contact = contact;
+    if (address !== undefined) updates.address = address;
+    if (number !== undefined) updates.number = number;
+    if (country !== undefined) updates.country = country;
+    if (state !== undefined) updates.state = state;
+    if (city !== undefined) updates.city = city;
+    if (neighborhood !== undefined) updates.neighborhood = neighborhood;
+    if (zip !== undefined) updates.zip = zip;
+    if (complement !== undefined) updates.complement = complement;
+
+    const { error } = await supabase.from("developers").update(updates).eq("id", id).eq("tenant_id", user.tenant_id);
+    if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+  } else if (type === "property") {
+    const updates: Record<string, unknown> = {};
+    if (code !== undefined) updates.code = code;
+    if (price !== undefined) updates.price = Number(price);
+    if (area !== undefined) updates.area = Number(area);
+    if (bedrooms !== undefined) updates.bedrooms = Number(bedrooms);
+    if (status !== undefined) updates.status = status;
+    if (developmentId !== undefined) updates.development_id = developmentId;
+    if (developerId !== undefined) updates.developer_id = developerId;
+
+    const { error } = await supabase.from("properties").update(updates).eq("id", id).eq("tenant_id", user.tenant_id);
+    if (error) return NextResponse.json({ error: error.message }, { status: 500 });
   }
+
+  return NextResponse.json({ success: true });
 }
 
 export async function DELETE(req: Request) {
-  try {
-    const db = getDb();
-    const user = await getAuthUser(db);
-    if (!user) return NextResponse.json({ error: "Não autenticado." }, { status: 401 });
-    if (user.role !== "Admin") return NextResponse.json({ error: "Apenas Admin." }, { status: 403 });
+  const supabase = getSupabaseAdmin();
+  const user = await getAuthUser();
+  if (!user) return NextResponse.json({ error: "Não autenticado." }, { status: 401 });
+  if (user.role !== "Admin") return NextResponse.json({ error: "Apenas Admin." }, { status: 403 });
 
-    const { type, id } = await req.json();
+  const body = await req.json();
+  const { type, id } = body;
+  if (!type || !id) return NextResponse.json({ error: "Dados inválidos." }, { status: 400 });
 
-    if (type === "developer") {
-      // Check if there are developments linking to this developer
-      const hasDevs = (db.prepare("SELECT COUNT(*) as c FROM developments WHERE developer_id = ?").get(id) as any).c;
-      if (hasDevs > 0) {
-        return NextResponse.json({ error: "Excluir construtora bloqueado: existem empreendimentos vinculados a ela." }, { status: 409 });
-      }
-      db.prepare("DELETE FROM developers WHERE id = ?").run(id);
-    } else if (type === "property") {
-      db.prepare("DELETE FROM properties WHERE id = ?").run(id);
+  if (type === "developer") {
+    const { count } = await supabase
+      .from("developments")
+      .select("*", { count: "exact", head: true })
+      .eq("developer_id", id);
+
+    if ((count ?? 0) > 0) {
+      return NextResponse.json({ error: "Excluir construtora bloqueado: existem empreendimentos vinculados a ela." }, { status: 409 });
     }
-
-    return NextResponse.json({ success: true });
-  } catch (err: any) {
-    return NextResponse.json({ error: err.message }, { status: 500 });
+    const { error } = await supabase.from("developers").delete().eq("id", id).eq("tenant_id", user.tenant_id);
+    if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+  } else if (type === "property") {
+    const { error } = await supabase.from("properties").delete().eq("id", id).eq("tenant_id", user.tenant_id);
+    if (error) return NextResponse.json({ error: error.message }, { status: 500 });
   }
+
+  return NextResponse.json({ success: true });
 }
