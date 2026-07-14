@@ -1,128 +1,167 @@
 import { NextResponse } from "next/server";
-import { getDb } from "../../../../lib/db";
-import { distributeLead } from "../../../../lib/distribution";
+import { getSupabaseAdmin } from "../../../../lib/supabase";
+import { distributeLeadAsync } from "../../../../lib/distribution";
 import { validatePhoneE164, sanitizeName } from "@crm/validation";
 
 export async function POST(req: Request) {
   try {
-    const { channel, phone, name, email, body, interest, externalId } = await req.json();
+    const { channel, phone, name, email, body, externalId } = await req.json();
 
     if (!channel || !body) {
       return NextResponse.json({ error: "Canal e corpo da mensagem são obrigatórios." }, { status: 400 });
     }
 
-    const db = getDb();
+    const supabase = getSupabaseAdmin();
     const cleanPhone = phone ? phone.trim() : "+5511999990000";
     const cleanName = sanitizeName(name || "Cliente Simulação");
     const cleanEmail = email ? email.trim() : "";
 
-    // 1. Lead Resolver (D3/D4)
-    let lead = null;
-    if (phone) {
-      lead = db.prepare("SELECT * FROM leads WHERE phone = ?").get(cleanPhone) as any;
-    }
-    if (!lead && cleanEmail) {
-      lead = db.prepare("SELECT * FROM leads WHERE email = ?").get(cleanEmail) as any;
+    // Validate phone format
+    if (phone && !validatePhoneE164(cleanPhone)) {
+      return NextResponse.json({ error: "Simulação abortada: Telefone inválido no formato E.164." }, { status: 400 });
     }
 
-    let leadId = lead?.id;
-    let brokerId = lead?.responsible_broker_id;
-    const isNewLead = !lead;
+    // 1. Lead Resolver — procura por telefone ou e-mail
+    let existingLead: any = null;
+    if (cleanPhone) {
+      const { data } = await supabase.from("leads").select("*").eq("phone", cleanPhone).maybeSingle();
+      existingLead = data;
+    }
+    if (!existingLead && cleanEmail) {
+      const { data } = await supabase.from("leads").select("*").eq("email", cleanEmail).maybeSingle();
+      existingLead = data;
+    }
+
+    let leadId = existingLead?.id;
+    let brokerId = existingLead?.responsible_broker_id;
+    const isNewLead = !existingLead;
 
     if (isNewLead) {
-      // Validate phone format (D3)
-      if (phone && !validatePhoneE164(cleanPhone)) {
-        return NextResponse.json({ error: "Simulação abortada: Telefone inválido no formato E.164." }, { status: 400 });
-      }
-
-      // Check fuzzy duplicate matching
-      const dup = db.prepare("SELECT * FROM leads WHERE phone = ?").get(cleanPhone) as any;
-      if (dup) {
-        return NextResponse.json({ error: "Simulação abortada: Lead duplicado detectado." }, { status: 409 });
-      }
-
-      // Call advanced routing engine
-      const distResult = distributeLead(db, "tenant-1");
+      const distResult = await distributeLeadAsync(supabase, "tenant-1");
       brokerId = distResult.brokerId;
-      const ruleId = distResult.ruleId || "rule-1";
+      const ruleId = distResult.ruleId;
       const decisionReason = distResult.reason;
 
-      const leadsCount = (db.prepare("SELECT count(*) as count FROM leads").get() as any).count;
-      leadId = "lead-" + Math.random().toString(36).substr(2, 9);
-      const leadCode = `LD-2026-${String(leadsCount + 1).padStart(4, "0")}`;
+      const { count: leadsCount } = await supabase
+        .from("leads")
+        .select("*", { count: "exact", head: true })
+        .eq("tenant_id", "tenant-1");
 
-      // Insert Lead
-      db.prepare(`
-        INSERT INTO leads (id, tenant_id, code, name, phone, email, entered_at, estimated_value, tracking_source, temperature, stage_id, responsible_broker_id, dedupe_status)
-        VALUES (?, 'tenant-1', ?, ?, ?, ?, datetime('now'), 0.0, ?, 'morno', 'stage-1', ?, 'unique')
-      `).run(leadId, leadCode, cleanName, cleanPhone, cleanEmail, channel.toUpperCase(), brokerId);
+      const leadCode = `LD-2026-${String((leadsCount ?? 0) + 1).padStart(4, "0")}`;
 
-      // Log distribution (D5)
-      db.prepare(`
-        INSERT INTO distribution_log (id, lead_id, rule_id, assigned_broker_id, decision_reason)
-        VALUES (?, ?, ?, ?, ?)
-      `).run("dist-" + Math.random().toString(36).substr(2, 9), leadId, ruleId, brokerId, decisionReason);
+      const { data: newLead, error: leadErr } = await supabase
+        .from("leads")
+        .insert({
+          tenant_id: "tenant-1",
+          code: leadCode,
+          name: cleanName,
+          phone: cleanPhone,
+          email: cleanEmail || null,
+          tracking_source: channel.toUpperCase(),
+          temperature: "morno",
+          responsible_broker_id: brokerId,
+          dedupe_status: "unique",
+        })
+        .select()
+        .single();
 
-      // Audit Log (D5)
-      db.prepare(`
-        INSERT INTO audit_log (id, tenant_id, actor_id, action, entity_type, entity_id, details)
-        VALUES (?, 'tenant-1', 'admin-id', 'lead.created', 'leads', ?, ?)
-      `).run(
-        "audit-" + Math.random().toString(36).substr(2, 9),
-        leadId,
-        `Lead ${leadCode} autocriado via webhook simulator (${channel}).`
-      );
+      if (leadErr) return NextResponse.json({ error: leadErr.message }, { status: 500 });
+      leadId = newLead.id;
+
+      await Promise.all([
+        supabase.from("distribution_log").insert({
+          lead_id: leadId,
+          rule_id: ruleId,
+          assigned_broker_id: brokerId,
+          decision_reason: decisionReason,
+        }),
+        supabase.from("audit_log").insert({
+          tenant_id: "tenant-1",
+          action: "lead.created",
+          entity_type: "leads",
+          entity_id: leadId,
+          details: `Lead ${leadCode} autocriado via webhook simulator (${channel}).`,
+        }),
+      ]);
     }
 
-    // 2. Fetch or create Channel
-    let channelObj = db.prepare("SELECT * FROM channels WHERE type = ?").get(channel) as any;
+    // 2. Canal
+    let { data: channelObj } = await supabase
+      .from("channels")
+      .select("id")
+      .eq("tenant_id", "tenant-1")
+      .eq("type", channel)
+      .limit(1)
+      .maybeSingle();
+
     if (!channelObj) {
-      const channelId = "chan-" + Math.random().toString(36).substr(2, 9);
-      db.prepare(`
-        INSERT INTO channels (id, tenant_id, type, identity, status)
-        VALUES (?, 'tenant-1', ?, ?, 'active')
-      `).run(channelId, channel, `@sim_${channel}`);
-      channelObj = { id: channelId };
+      const { data: newChan } = await supabase
+        .from("channels")
+        .insert({ tenant_id: "tenant-1", type: channel, identity: `@sim_${channel}`, status: "active" })
+        .select()
+        .single();
+      channelObj = newChan;
     }
+
+    const channelId = channelObj?.id ?? null;
 
     // 3. Procura ou cria conversa
-    let conv = db.prepare("SELECT * FROM conversations WHERE lead_id = ? AND channel_id = ?").get(leadId, channelObj.id) as any;
-    let convId = conv?.id;
+    const { data: existingConv } = await supabase
+      .from("conversations")
+      .select("id, unread_count")
+      .eq("lead_id", leadId)
+      .eq("channel_id", channelId)
+      .maybeSingle();
 
-    if (!conv) {
-      convId = "conv-" + Math.random().toString(36).substr(2, 9);
-      db.prepare(`
-        INSERT INTO conversations (id, tenant_id, lead_id, channel_id, assigned_broker_id, status, unread_count, last_message_at, wa_window_expires_at)
-        VALUES (?, 'tenant-1', ?, ?, ?, 'open', 1, datetime('now'), datetime('now', '+24 hours'))
-      `).run(convId, leadId, channelObj.id, brokerId);
+    let convId = existingConv?.id;
+
+    if (!existingConv) {
+      const waExpires = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+      const { data: newConv, error: convErr } = await supabase
+        .from("conversations")
+        .insert({
+          tenant_id: "tenant-1",
+          lead_id: leadId,
+          channel_id: channelId,
+          assigned_broker_id: brokerId,
+          status: "open",
+          unread_count: 1,
+          last_message_at: new Date().toISOString(),
+          wa_window_expires_at: waExpires,
+        })
+        .select()
+        .single();
+
+      if (convErr) return NextResponse.json({ error: convErr.message }, { status: 500 });
+      convId = newConv.id;
     } else {
-      db.prepare(`
-        UPDATE conversations 
-        SET unread_count = unread_count + 1,
-            last_message_at = datetime('now'),
-            wa_window_expires_at = datetime('now', '+24 hours')
-        WHERE id = ?
-      `).run(convId);
+      await supabase
+        .from("conversations")
+        .update({
+          unread_count: (existingConv.unread_count ?? 0) + 1,
+          last_message_at: new Date().toISOString(),
+          wa_window_expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+        })
+        .eq("id", convId);
     }
 
-    // 4. Insere Mensagem
-    const messageId = "msg-" + Math.random().toString(36).substr(2, 9);
-    const extId = externalId || "ext-" + Math.random().toString(36).substr(2, 9);
-
-    db.prepare(`
-      INSERT INTO messages (id, conversation_id, direction, external_id, sender, content_type, body, occurred_at, status)
-      VALUES (?, ?, 'in', ?, ?, 'text', ?, datetime('now'), 'delivered')
-    `).run(messageId, convId, extId, cleanName, body);
-
-    // 5. Insere timeline event
-    db.prepare(`
-      INSERT INTO timeline_events (id, lead_id, type, payload)
-      VALUES (?, ?, 'message', ?)
-    `).run(
-      "time-" + Math.random().toString(36).substr(2, 9),
-      leadId,
-      JSON.stringify({ body, direction: "in", channel })
-    );
+    // 4. Mensagem e timeline
+    await Promise.all([
+      supabase.from("messages").insert({
+        conversation_id: convId,
+        direction: "in",
+        external_id: externalId || "ext-" + Math.random().toString(36).substr(2, 9),
+        sender: cleanName,
+        content_type: "text",
+        body,
+        status: "delivered",
+      }),
+      supabase.from("timeline_events").insert({
+        lead_id: leadId,
+        type: "message",
+        payload: { body, direction: "in", channel },
+      }),
+    ]);
 
     return NextResponse.json({ success: true, leadId, conversationId: convId, isNewLead });
   } catch (err: any) {

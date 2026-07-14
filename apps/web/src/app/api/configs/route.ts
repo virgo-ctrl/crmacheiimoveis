@@ -1,105 +1,5 @@
 import { NextResponse } from "next/server";
-import { cookies } from "next/headers";
-import { getDb } from "../../../lib/db";
-
-async function getAuthUser(db: any) {
-  const cookieStore = await cookies();
-  const userId = cookieStore.get("crm_session")?.value;
-  if (!userId) return null;
-
-  const user = db.prepare("SELECT * FROM users WHERE id = ?").get(userId) as any;
-  if (!user) return null;
-
-  const roleObj = db.prepare(`
-    SELECT r.name 
-    FROM roles r
-    JOIN user_roles ur ON ur.role_id = r.id
-    WHERE ur.user_id = ?
-  `).get(userId) as any;
-
-  return {
-    ...user,
-    role: roleObj ? roleObj.name : "Corretor",
-  };
-}
-
-export async function GET() {
-  try {
-    const db = getDb();
-    const user = await getAuthUser(db);
-    if (!user) return NextResponse.json({ error: "Não autenticado." }, { status: 401 });
-
-    const sources = db.prepare("SELECT * FROM lead_sources").all() as any[];
-    const campaigns = db.prepare("SELECT * FROM campaigns").all() as any[];
-    const lossReasons = db.prepare("SELECT * FROM loss_reasons").all() as any[];
-    const templates = db.prepare("SELECT * FROM message_templates").all() as any[];
-    const stages = db.prepare("SELECT * FROM funnel_stages ORDER BY \"order\"").all() as any[];
-    const scripts = db.prepare("SELECT * FROM qualification_scripts WHERE active = 1").all() as any[];
-    const channels = db.prepare("SELECT * FROM channels").all() as any[];
-
-    return NextResponse.json({ sources, campaigns, lossReasons, templates, stages, scripts, channels });
-  } catch (err: any) {
-    return NextResponse.json({ error: err.message }, { status: 500 });
-  }
-}
-
-export async function POST(req: Request) {
-  try {
-    const db = getDb();
-    const user = await getAuthUser(db);
-    if (!user) return NextResponse.json({ error: "Não autenticado." }, { status: 401 });
-
-    if (user.role !== "Admin") {
-      return NextResponse.json({ error: "Apenas administradores podem modificar configurações de negócio." }, { status: 403 });
-    }
-
-    const { type, name, waBody } = await req.json();
-
-    if (type === "source") {
-      const id = "source-" + Math.random().toString(36).substr(2, 9);
-      db.prepare("INSERT INTO lead_sources (id, tenant_id, name, active) VALUES (?, ?, ?, 1)").run(id, user.tenant_id, name);
-    } else if (type === "campaign") {
-      const id = "camp-" + Math.random().toString(36).substr(2, 9);
-      db.prepare("INSERT INTO campaigns (id, tenant_id, name, active) VALUES (?, ?, ?, 1)").run(id, user.tenant_id, name);
-    } else if (type === "loss") {
-      const id = "loss-" + Math.random().toString(36).substr(2, 9);
-      db.prepare("INSERT INTO loss_reasons (id, tenant_id, name, active) VALUES (?, ?, ?, 1)").run(id, user.tenant_id, name);
-    } else if (type === "template") {
-      const id = "tpl-" + Math.random().toString(36).substr(2, 9);
-      db.prepare("INSERT INTO message_templates (id, tenant_id, channel_type, name, body, wa_approval_status, active) VALUES (?, ?, 'whatsapp', ?, ?, 'APPROVED', 1)").run(id, user.tenant_id, name, waBody);
-    } else if (type === "stage") {
-      const id = "stage-" + Math.random().toString(36).substr(2, 9);
-      const maxOrder = (db.prepare('SELECT COALESCE(MAX("order"), 0) as m FROM funnel_stages WHERE tenant_id = ?').get(user.tenant_id) as any).m;
-      db.prepare('INSERT INTO funnel_stages (id, tenant_id, name, "order", is_won, is_lost) VALUES (?, ?, ?, ?, 0, 0)').run(id, user.tenant_id, name, maxOrder + 1);
-    } else if (type === "script") {
-      const id = "script-" + Math.random().toString(36).substr(2, 9);
-      db.prepare("INSERT INTO qualification_scripts (id, tenant_id, name, body, active) VALUES (?, ?, ?, ?, 1)").run(id, user.tenant_id, name, waBody || "");
-    } else if (type === "channel") {
-      const id = "chan-" + Math.random().toString(36).substr(2, 9);
-      const { identity, channelType, credentialsRef } = await req.json();
-      db.prepare("INSERT INTO channels (id, tenant_id, type, identity, owner_user_id, status, credentials_ref) VALUES (?, ?, ?, ?, ?, 'active', ?)")
-        .run(id, user.tenant_id, channelType || "whatsapp", identity || "", user.id, credentialsRef || "sec-token");
-    } else {
-      return NextResponse.json({ error: "Tipo de configuração inválido." }, { status: 400 });
-    }
-
-    // Log audit
-    db.prepare(`
-      INSERT INTO audit_log (id, tenant_id, actor_id, action, entity_type, entity_id, details, ip)
-      VALUES (?, ?, ?, 'config.updated', 'configs', ?, ?, '127.0.0.1')
-    `).run(
-      "audit-" + Math.random().toString(36).substr(2, 9),
-      user.tenant_id,
-      user.id,
-      "CONFIG",
-      `Configuração adicionada: ${type} - ${name}.`
-    );
-
-    return NextResponse.json({ success: true });
-  } catch (err: any) {
-    return NextResponse.json({ error: err.message }, { status: 500 });
-  }
-}
+import { getSupabaseAdmin, getAuthUser } from "../../../lib/supabase";
 
 const TABLE_MAP: Record<string, string> = {
   source: "lead_sources",
@@ -111,70 +11,152 @@ const TABLE_MAP: Record<string, string> = {
   channel: "channels",
 };
 
-// RENOMEAR / EDITAR item de configuração
-export async function PUT(req: Request) {
-  try {
-    const db = getDb();
-    const user = await getAuthUser(db);
-    if (!user) return NextResponse.json({ error: "Não autenticado." }, { status: 401 });
-    if (user.role !== "Admin") return NextResponse.json({ error: "Apenas administradores podem editar configurações." }, { status: 403 });
+export async function GET(req: Request) {
+  const supabase = getSupabaseAdmin();
+  const user = await getAuthUser();
+  if (!user) return NextResponse.json({ error: "Não autenticado." }, { status: 401 });
 
-    const { type, id, name, isWon, isLost } = await req.json();
-    const table = TABLE_MAP[type];
-    if (!table || !id || !name?.trim()) return NextResponse.json({ error: "Dados inválidos." }, { status: 400 });
+  const [sources, campaigns, lossReasons, templates, stages, scripts, channels] = await Promise.all([
+    supabase.from("lead_sources").select("*").eq("tenant_id", user.tenant_id),
+    supabase.from("campaigns").select("*").eq("tenant_id", user.tenant_id),
+    supabase.from("loss_reasons").select("*").eq("tenant_id", user.tenant_id),
+    supabase.from("message_templates").select("*").eq("tenant_id", user.tenant_id),
+    supabase.from("funnel_stages").select("*").eq("tenant_id", user.tenant_id).order("order"),
+    supabase.from("qualification_scripts").select("*").eq("tenant_id", user.tenant_id).eq("active", true),
+    supabase.from("channels").select("*").eq("tenant_id", user.tenant_id),
+  ]);
 
-    db.prepare(`UPDATE ${table} SET name = ? WHERE id = ? AND tenant_id = ?`).run(name.trim(), id, user.tenant_id);
-
-    // Para canais, atualiza a identidade e tipo
-    if (type === "channel") {
-      const { identity, channelType, credentialsRef } = await req.json();
-      db.prepare("UPDATE channels SET identity = COALESCE(?, identity), type = COALESCE(?, type), credentials_ref = COALESCE(?, credentials_ref) WHERE id = ? AND tenant_id = ?")
-        .run(identity, channelType, credentialsRef, id, user.tenant_id);
-    }
-
-    // Para etapas, permite marcar ganho/perda
-    if (type === "stage" && (isWon !== undefined || isLost !== undefined)) {
-      db.prepare('UPDATE funnel_stages SET is_won = COALESCE(?, is_won), is_lost = COALESCE(?, is_lost) WHERE id = ? AND tenant_id = ?')
-        .run(isWon === undefined ? null : (isWon ? 1 : 0), isLost === undefined ? null : (isLost ? 1 : 0), id, user.tenant_id);
-    }
-
-    db.prepare(`
-      INSERT INTO audit_log (id, tenant_id, actor_id, action, entity_type, entity_id, details, ip)
-      VALUES (?, ?, ?, 'config.updated', 'configs', ?, ?, '127.0.0.1')
-    `).run("audit-" + Math.random().toString(36).substr(2, 9), user.tenant_id, user.id, id, `Configuração (${type}) renomeada para "${name}".`);
-
-    return NextResponse.json({ success: true });
-  } catch (err: any) {
-    return NextResponse.json({ error: err.message }, { status: 500 });
-  }
+  return NextResponse.json({
+    sources: sources.data ?? [],
+    campaigns: campaigns.data ?? [],
+    lossReasons: lossReasons.data ?? [],
+    templates: templates.data ?? [],
+    stages: stages.data ?? [],
+    scripts: scripts.data ?? [],
+    channels: channels.data ?? [],
+  });
 }
 
-// EXCLUIR item de configuração
-export async function DELETE(req: Request) {
-  try {
-    const db = getDb();
-    const user = await getAuthUser(db);
-    if (!user) return NextResponse.json({ error: "Não autenticado." }, { status: 401 });
-    if (user.role !== "Admin") return NextResponse.json({ error: "Apenas administradores podem excluir configurações." }, { status: 403 });
+export async function POST(req: Request) {
+  const supabase = getSupabaseAdmin();
+  const user = await getAuthUser();
+  if (!user) return NextResponse.json({ error: "Não autenticado." }, { status: 401 });
+  if (user.role !== "Admin") return NextResponse.json({ error: "Apenas administradores podem modificar configurações." }, { status: 403 });
 
-    const { type, id } = await req.json();
-    const table = TABLE_MAP[type];
-    if (!table || !id) return NextResponse.json({ error: "Dados inválidos." }, { status: 400 });
+  const body = await req.json();
+  const { type, name, waBody, identity, channelType, credentialsRef } = body;
+  const table = TABLE_MAP[type];
+  if (!table) return NextResponse.json({ error: "Tipo de configuração inválido." }, { status: 400 });
 
-    if (type === "stage") {
-      const count = (db.prepare("SELECT COUNT(*) as c FROM leads WHERE stage_id = ?").get(id) as any).c;
-      if (count > 0) return NextResponse.json({ error: `Não é possível excluir: existem ${count} leads nesta etapa. Mova-os antes.` }, { status: 409 });
-    }
+  let payload: Record<string, unknown> = { tenant_id: user.tenant_id, name };
 
-    db.prepare(`DELETE FROM ${table} WHERE id = ? AND tenant_id = ?`).run(id, user.tenant_id);
-
-    db.prepare(`
-      INSERT INTO audit_log (id, tenant_id, actor_id, action, entity_type, entity_id, details, ip)
-      VALUES (?, ?, ?, 'config.deleted', 'configs', ?, ?, '127.0.0.1')
-    `).run("audit-" + Math.random().toString(36).substr(2, 9), user.tenant_id, user.id, id, `Configuração (${type}) excluída.`);
-
-    return NextResponse.json({ success: true });
-  } catch (err: any) {
-    return NextResponse.json({ error: err.message }, { status: 500 });
+  if (type === "template") {
+    payload = { ...payload, channel_type: "whatsapp", body: waBody, wa_approval_status: "APPROVED", active: true };
+  } else if (type === "stage") {
+    const { data: maxRow } = await supabase
+      .from("funnel_stages")
+      .select("order")
+      .eq("tenant_id", user.tenant_id)
+      .order("order", { ascending: false })
+      .limit(1)
+      .single();
+    payload = { ...payload, order: ((maxRow as any)?.order ?? 0) + 1, is_won: false, is_lost: false };
+  } else if (type === "script") {
+    payload = { ...payload, body: waBody ?? "", active: true };
+  } else if (type === "channel") {
+    payload = { ...payload, type: channelType ?? "whatsapp", identity: identity ?? "", owner_user_id: user.id, status: "active", credentials_ref: credentialsRef ?? "sec-token" };
+    // channel table has a "type" column, not a "name" column
+    delete payload.name;
   }
+
+  const { data: inserted, error } = await supabase.from(table).insert(payload).select().single();
+  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+
+  await supabase.from("audit_log").insert({
+    tenant_id: user.tenant_id,
+    actor_id: user.id,
+    action: "config.created",
+    entity_type: "configs",
+    entity_id: inserted.id,
+    details: `Configuração adicionada: ${type} - ${name}.`,
+    ip: "server",
+  });
+
+  return NextResponse.json(inserted, { status: 201 });
+}
+
+export async function PUT(req: Request) {
+  const supabase = getSupabaseAdmin();
+  const user = await getAuthUser();
+  if (!user) return NextResponse.json({ error: "Não autenticado." }, { status: 401 });
+  if (user.role !== "Admin") return NextResponse.json({ error: "Apenas administradores podem editar configurações." }, { status: 403 });
+
+  const body = await req.json();
+  const { type, id, name, isWon, isLost, identity, channelType, credentialsRef } = body;
+  const table = TABLE_MAP[type];
+  if (!table || !id) return NextResponse.json({ error: "Dados inválidos." }, { status: 400 });
+
+  const updates: Record<string, unknown> = {};
+  if (name !== undefined) updates.name = name;
+  if (type === "stage") {
+    if (isWon !== undefined) updates.is_won = isWon;
+    if (isLost !== undefined) updates.is_lost = isLost;
+  }
+  if (type === "channel") {
+    if (identity !== undefined) updates.identity = identity;
+    if (channelType !== undefined) updates.type = channelType;
+    if (credentialsRef !== undefined) updates.credentials_ref = credentialsRef;
+  }
+
+  const { error } = await supabase.from(table).update(updates).eq("id", id).eq("tenant_id", user.tenant_id);
+  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+
+  await supabase.from("audit_log").insert({
+    tenant_id: user.tenant_id,
+    actor_id: user.id,
+    action: "config.updated",
+    entity_type: "configs",
+    entity_id: id,
+    details: `Configuração (${type}) atualizada.`,
+    ip: "server",
+  });
+
+  return NextResponse.json({ success: true });
+}
+
+export async function DELETE(req: Request) {
+  const supabase = getSupabaseAdmin();
+  const user = await getAuthUser();
+  if (!user) return NextResponse.json({ error: "Não autenticado." }, { status: 401 });
+  if (user.role !== "Admin") return NextResponse.json({ error: "Apenas administradores podem excluir configurações." }, { status: 403 });
+
+  const body = await req.json();
+  const { type, id } = body;
+  const table = TABLE_MAP[type];
+  if (!table || !id) return NextResponse.json({ error: "Dados inválidos." }, { status: 400 });
+
+  if (type === "stage") {
+    const { count } = await supabase
+      .from("leads")
+      .select("*", { count: "exact", head: true })
+      .eq("stage_id", id);
+    if ((count ?? 0) > 0) {
+      return NextResponse.json({ error: `Não é possível excluir: existem ${count} leads nesta etapa. Mova-os antes.` }, { status: 409 });
+    }
+  }
+
+  const { error } = await supabase.from(table).delete().eq("id", id).eq("tenant_id", user.tenant_id);
+  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+
+  await supabase.from("audit_log").insert({
+    tenant_id: user.tenant_id,
+    actor_id: user.id,
+    action: "config.deleted",
+    entity_type: "configs",
+    entity_id: id,
+    details: `Configuração (${type}) excluída.`,
+    ip: "server",
+  });
+
+  return NextResponse.json({ success: true });
 }
