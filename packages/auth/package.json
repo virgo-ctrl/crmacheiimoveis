@@ -1,0 +1,22 @@
+{
+  "name": "@crm/auth",
+  "version": "1.0.0",
+  "private": true,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc -w",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@crm/core": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.5",
+    "vitest": "^1.6.0",
+    "pg": "^8.11.5",
+    "@types/pg": "^8.11.6",
+    "dotenv": "^16.4.5"
+  }
+}

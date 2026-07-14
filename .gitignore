@@ -1,0 +1,10 @@
+node_modules
+.next
+.turbo
+dist
+*.db
+*.db-journal
+*.log
+.env
+.env.local
+git_status_check.txt

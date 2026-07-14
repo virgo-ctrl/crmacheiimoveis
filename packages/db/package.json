@@ -1,0 +1,19 @@
+{
+  "name": "@crm/db",
+  "version": "1.0.0",
+  "private": true,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc -w"
+  },
+  "dependencies": {
+    "@crm/core": "workspace:*",
+    "pg": "^8.11.5"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.5",
+    "@types/pg": "^8.11.6"
+  }
+}
