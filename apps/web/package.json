@@ -9,13 +9,15 @@
     "lint": "next lint"
   },
   "dependencies": {
-    "next": "16.2.10",
-    "react": "19.2.4",
-    "react-dom": "19.2.4",
+    "@crm/auth": "workspace:*",
     "@crm/core": "workspace:*",
     "@crm/db": "workspace:*",
-    "@crm/auth": "workspace:*",
-    "@crm/validation": "workspace:*"
+    "@crm/validation": "workspace:*",
+    "@supabase/ssr": "^0.12.1",
+    "@supabase/supabase-js": "^2.110.3",
+    "next": "16.2.10",
+    "react": "19.2.4",
+    "react-dom": "19.2.4"
   },
   "devDependencies": {
     "@types/node": "^20",
