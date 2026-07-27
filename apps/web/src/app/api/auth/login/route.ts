@@ -12,32 +12,24 @@ export async function POST(req: Request) {
 
     const supabase = getSupabaseAdmin();
 
-    // Busca usuário pelo email
-    const { data: user, error: userError } = await supabase
-      .from("users")
-      .select("id, tenant_id, name, email, status, password_hash")
-      .eq("email", email)
-      .single();
-
-    if (userError || !user) {
-      return NextResponse.json({ error: "E-mail ou senha incorretos." }, { status: 401 });
-    }
-
-    if (user.status !== "ativo") {
-      return NextResponse.json({ error: "Sua conta está inativa." }, { status: 403 });
-    }
-
-    // Verifica senha com pgcrypto via rpc
-    const { data: valid, error: cryptoError } = await supabase.rpc("verify_password", {
-      plain: password,
-      hashed: user.password_hash,
+    // RPC login_with_password: consulta users + user_roles, verifica bcrypt internamente
+    const { data, error } = await supabase.rpc("login_with_password", {
+      p_email: email,
+      p_password: password,
     });
 
-    console.log("[v0] verify_password result:", { valid, cryptoError });
-    if (cryptoError || !valid) {
+    if (error) {
+      console.log("[v0] login rpc error:", error.message);
+      return NextResponse.json({ error: "Erro interno. Tente novamente." }, { status: 500 });
+    }
+
+    const user = Array.isArray(data) ? data[0] : data;
+
+    if (!user) {
       return NextResponse.json({ error: "E-mail ou senha incorretos." }, { status: 401 });
     }
 
+    // Salva sessão em cookie httpOnly
     const cookieStore = await cookies();
     cookieStore.set("crm_session", user.id, {
       httpOnly: true,
@@ -46,7 +38,8 @@ export async function POST(req: Request) {
       maxAge: 60 * 60 * 24 * 7,
     });
 
-    await supabase.from("audit_log").insert({
+    // Registra no audit_log (sem bloquear resposta em caso de falha)
+    supabase.from("audit_log").insert({
       tenant_id: user.tenant_id,
       actor_id: user.id,
       action: "user.login",
@@ -54,10 +47,16 @@ export async function POST(req: Request) {
       entity_id: user.id,
       details: "Usuário efetuou login com sucesso.",
       ip: "127.0.0.1",
-    });
+    }).then();
 
-    return NextResponse.json({ success: true, userId: user.id });
+    return NextResponse.json({
+      success: true,
+      userId: user.id,
+      name: user.name,
+      role: user.role_name,
+    });
   } catch (err: any) {
+    console.log("[v0] login error:", err.message);
     return NextResponse.json({ error: err.message }, { status: 500 });
   }
 }
