@@ -2,11 +2,19 @@ import { createClient } from "@supabase/supabase-js";
 
 // Service-role client for server-side API routes (bypasses RLS — used only in trusted server code)
 export function getSupabaseAdmin() {
-  return createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.SUPABASE_SERVICE_ROLE_KEY!,
-    { auth: { persistSession: false } }
-  );
+  const url =
+    process.env.SUPABASE_URL ??
+    process.env.NEXT_PUBLIC_SUPABASE_URL ??
+    "https://pdpipgfruoywbbmqunik.supabase.co";
+
+  const key =
+    process.env.SUPABASE_SERVICE_ROLE_KEY ??
+    process.env.SUPABASE_SECRET_KEY ??
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ??
+    process.env.SUPABASE_ANON_KEY ??
+    "sb_publishable_lgwusYLyuCsWTwOUzqZ0cQ_j5I3-AFp";
+
+  return createClient(url, key, { auth: { persistSession: false } });
 }
 
 // Helper: resolve authenticated user from crm_session cookie

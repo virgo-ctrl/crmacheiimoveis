@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { useUser } from "../../../components/app-context";
+import ImportLeadsModal from "../../../components/ImportLeadsModal";
 
 interface Lead {
   id: string; code: string; name: string; email: string; phone: string;
@@ -56,6 +57,7 @@ export default function LeadsPage() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<any>(null);
   const [creating, setCreating] = useState(false);
+  const [importing, setImporting] = useState(false);
 
   const load = () => {
     fetch("/api/leads").then((r) => r.json()).then((d) => setLeads(d.leads || []));
@@ -155,7 +157,8 @@ export default function LeadsPage() {
           <p className="page-sub">Escopo {user.role} · {filtered.length} de {leads.length} leads</p>
         </div>
         <div className="flex-gap">
-          <button className="btn btn-ghost" onClick={handleExportCSV}>📥 Exportar CSV (Audita D5)</button>
+          <button className="btn btn-ghost" onClick={() => setImporting(true)}>Importar Leads</button>
+          <button className="btn btn-ghost" onClick={handleExportCSV}>Exportar CSV</button>
           <div className="flex-gap" style={{ background: "var(--surface-2)", border: "1px solid var(--border-color)", borderRadius: 9, padding: 3 }}>
             <button className={`btn ${view === "kanban" ? "btn-primary" : "btn-ghost"}`} style={{ padding: "0.35rem 0.8rem" }} onClick={() => setView("kanban")}>Kanban</button>
             <button className={`btn ${view === "lista" ? "btn-primary" : "btn-ghost"}`} style={{ padding: "0.35rem 0.8rem" }} onClick={() => setView("lista")}>Lista</button>
@@ -287,6 +290,7 @@ export default function LeadsPage() {
       )}
 
       {creating && <NewLeadModal sources={sources} developments={developments} onClose={() => setCreating(false)} onSaved={() => { setCreating(false); load(); }} />}
+      {importing && <ImportLeadsModal onClose={() => setImporting(false)} onImported={load} />}
     </div>
   );
 }

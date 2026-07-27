@@ -5,21 +5,37 @@ import { getSupabaseAdmin } from "../../../../lib/supabase";
 export async function POST(req: Request) {
   try {
     const { email, password } = await req.json();
+
+    if (!email || !password) {
+      return NextResponse.json({ error: "E-mail e senha são obrigatórios." }, { status: 400 });
+    }
+
     const supabase = getSupabaseAdmin();
 
-    const { data: user } = await supabase
+    // Busca usuário pelo email
+    const { data: user, error: userError } = await supabase
       .from("users")
-      .select("*")
+      .select("id, tenant_id, name, email, status, password_hash")
       .eq("email", email)
-      .eq("password", password)
       .single();
 
-    if (!user) {
+    if (userError || !user) {
       return NextResponse.json({ error: "E-mail ou senha incorretos." }, { status: 401 });
     }
 
     if (user.status !== "ativo") {
       return NextResponse.json({ error: "Sua conta está inativa." }, { status: 403 });
+    }
+
+    // Verifica senha com pgcrypto via rpc
+    const { data: valid, error: cryptoError } = await supabase.rpc("verify_password", {
+      plain: password,
+      hashed: user.password_hash,
+    });
+
+    console.log("[v0] verify_password result:", { valid, cryptoError });
+    if (cryptoError || !valid) {
+      return NextResponse.json({ error: "E-mail ou senha incorretos." }, { status: 401 });
     }
 
     const cookieStore = await cookies();
