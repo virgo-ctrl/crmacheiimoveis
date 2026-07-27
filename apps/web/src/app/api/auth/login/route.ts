@@ -33,6 +33,7 @@ export async function POST(req: Request) {
       hashed: user.password_hash,
     });
 
+    console.log("[v0] verify_password result:", { valid, cryptoError });
     if (cryptoError || !valid) {
       return NextResponse.json({ error: "E-mail ou senha incorretos." }, { status: 401 });
     }
