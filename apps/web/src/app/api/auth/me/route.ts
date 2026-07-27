@@ -63,7 +63,10 @@ export async function PUT(req: Request) {
     }
 
     const updates: any = { name, email, phone: phone || "", avatar_url: avatarUrl || "" };
-    if (password) updates.password = password;
+    if (password) {
+      const { data: hashed } = await supabase.rpc("hash_password", { plain: password });
+      if (hashed) updates.password_hash = hashed;
+    }
 
     await supabase.from("users").update(updates).eq("id", userId);
 
